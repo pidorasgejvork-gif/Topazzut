@@ -52,10 +52,12 @@ BLOCKED = re.compile(r"(loli|shota|child\s*porn|детск\w*\s*порн|пор�
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("imagebot")
 
+telebot.logger.setLevel(logging.INFO)
+
 if not TOKEN:
     raise RuntimeError("Не задана переменная окружения TOKEN")
 
-bot = telebot.TeleBot(TOKEN, threaded=True)
+bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
 TG_SECRET = hashlib.sha256(TOKEN.encode()).hexdigest()
 
@@ -347,7 +349,16 @@ def cmd_start(message):
             return bot.send_message(message.chat.id, "🚫 Вы забанены.")
         send_menu(message.chat.id)
     except Exception:
-        log.exception("start")
+        log.exception("ОШИБКА В /start")
+        try:
+            bot.send_message(message.chat.id, "⚠️ Ошибка при запуске, попробуйте ещё раз позже.")
+        except Exception:
+            pass
+
+
+@bot.message_handler(commands=["ping"])
+def cmd_ping(message):
+    bot.send_message(message.chat.id, "pong ✅ бот работает")
 
 
 HELP_TEXT = ("❓ <b>Помощь</b>\n\n"
@@ -498,9 +509,14 @@ def text_handler(message):
 @app.route(f"/{TOKEN}", methods=["POST"])
 def telegram_webhook():
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TG_SECRET:
+        log.warning("Вебхук отклонён: неверный секретный заголовок")
         return "Forbidden", 403
-    update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
-    bot.process_new_updates([update])
+    try:
+        update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
+        log.info("Получено обновление %s", update.update_id)
+        bot.process_new_updates([update])
+    except Exception:
+        log.exception("ОШИБКА ОБРАБОТКИ ОБНОВЛЕНИЯ")
     return "OK", 200
 
 
@@ -520,6 +536,7 @@ def setup_webhook():
 
 init_db()
 setup_webhook()
+log.info("Бот запущен (bot.py)")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
