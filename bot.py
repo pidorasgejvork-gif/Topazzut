@@ -46,6 +46,10 @@ SIZES = {
     "landscape": ("🖥 Горизонтальный", (1024, 768)),
 }
 
+# Защита от неподходящих картинок (передаётся нейросети вместе с каждым запросом)
+SAFE_SUFFIX = ", fully clothed, family friendly, safe for work"
+NEGATIVE_PROMPT = "nsfw, nude, naked, topless, nudity, sexual, explicit, erotic, underwear, gore, violence, text, watermark"
+
 # Базовый фильтр запросов. Это минимум, а не полноценная модерация.
 BLOCKED = re.compile(r"(loli|shota|child\s*porn|детск\w*\s*порн|порн|nsfw|nude|naked|гол[аы][яй]\b)", re.I)
 
@@ -203,7 +207,8 @@ def is_subscribed(user_id):
 WELCOME = ("🎨 <b>Нейро-художник</b>\n\n"
            "Опишите картинку словами, и я её нарисую.\n"
            "Например: <i>космонавт верхом на лошади, закат, масляная живопись</i>\n\n"
-           "💡 Чем подробнее описание, тем лучше результат. Английский язык часто даёт точнее.")
+           "💡 Пишите коротко и по делу, лучше на английском: одна сцена, один-два объекта. "
+           "Надписи на картинке и конкретные персонажи из фильмов получаются плохо.")
 
 
 def send_menu(chat_id):
@@ -237,10 +242,11 @@ def wait_gate():
 
 def generate_image(prompt, style_key, size_key, seed):
     """Возвращает байты картинки или бросает исключение."""
-    full = prompt + STYLES[style_key][1]
+    full = prompt + STYLES[style_key][1] + SAFE_SUFFIX
     width, height = SIZES[size_key][1]
     url = f"https://image.pollinations.ai/prompt/{quote(full, safe='')}"
-    params = {"width": width, "height": height, "seed": seed, "nologo": "true"}
+    params = {"width": width, "height": height, "seed": seed, "nologo": "true",
+              "safe": "true", "negative_prompt": NEGATIVE_PROMPT}
     headers = {"Authorization": f"Bearer {IMAGE_API_KEY}"} if IMAGE_API_KEY else {}
     r = requests.get(url, params=params, headers=headers, timeout=120)
     ctype = r.headers.get("content-type", "")
