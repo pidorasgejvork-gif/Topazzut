@@ -7,6 +7,8 @@ import hashlib
 import sqlite3
 import logging
 import threading
+import itertools
+from collections import OrderedDict
 from io import BytesIO
 from datetime import datetime
 from contextlib import contextmanager
@@ -27,6 +29,7 @@ IMAGE_API_KEY = os.environ.get("IMAGE_API_KEY", "")      # необязател�
 
 SUPPORT_USERNAME = "coo_vernost"                          # поменяй на свой
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "")  # например "@mychannel"; пусто = без проверки
+IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "flux")
 IMG_START = os.environ.get("IMG_START", "")               # ссылка на картинку для меню; пусто = без картинки
 
 DAILY_FREE = int(os.environ.get("DAILY_FREE", 5))         # бесплатных генераций в сутки
@@ -35,15 +38,19 @@ MAX_QUEUE = 10                                            # максимум з�
 
 STYLES = {
     "none":      ("✨ Без стиля", ""),
+    "cartoon":   ("🎬 Мультфильм", ", cartoon style, flat colors, bold outlines, 2d animation, vibrant, clean lineart"),
     "realistic": ("📷 Реализм", ", photorealistic, highly detailed, natural lighting, 8k"),
     "anime":     ("🌸 Аниме", ", anime style, vibrant colors, detailed illustration"),
     "art":       ("🎨 Арт", ", digital painting, concept art, artstation, detailed"),
     "3d":        ("🧊 3D", ", 3d render, octane render, soft lighting, high detail"),
+    "pixel":     ("👾 Пиксель-арт", ", pixel art, 16-bit, retro game style, limited palette"),
+    "cyber":     ("🌃 Киберпанк", ", cyberpunk, neon lights, futuristic city, cinematic lighting"),
 }
 SIZES = {
     "square":    ("⬜ Квадрат", (1024, 1024)),
     "portrait":  ("📱 Вертикальный", (768, 1024)),
     "landscape": ("🖥 Горизонтальный", (1024, 768)),
+    "wide":      ("📺 YouTube 16:9", (1024, 576)),
 }
 
 # Защита от неподходящих картинок (передаётся нейросети вместе с каждым запросом)
@@ -207,7 +214,7 @@ def is_subscribed(user_id):
 WELCOME = ("🎨 <b>Нейро-художник</b>\n\n"
            "Опишите картинку словами, и я её нарисую.\n"
            "Например: <i>космонавт верхом на лошади, закат, масляная живопись</i>\n\n"
-           "💡 Пишите коротко и по делу, лучше на английском: одна сцена, один-два объекта. "
+           "💡 Можно писать по-русски, бот сам переведёт. Лучше коротко: одна сцена, один-два объекта. "
            "Надписи на картинке и конкретные персонажи из фильмов получаются плохо.")
 
 
@@ -246,7 +253,7 @@ def generate_image(prompt, style_key, size_key, seed):
     width, height = SIZES[size_key][1]
     url = f"https://image.pollinations.ai/prompt/{quote(full, safe='')}"
     params = {"width": width, "height": height, "seed": seed, "nologo": "true",
-              "safe": "true", "negative_prompt": NEGATIVE_PROMPT}
+              "safe": "true", "negative_prompt": NEGATIVE_PROMPT, "model": IMAGE_MODEL}
     headers = {"Authorization": f"Bearer {IMAGE_API_KEY}"} if IMAGE_API_KEY else {}
     r = requests.get(url, params=params, headers=headers, timeout=120)
     ctype = r.headers.get("content-type", "")
@@ -255,17 +262,75 @@ def generate_image(prompt, style_key, size_key, seed):
     return r.content
 
 
+CYR = re.compile(r"[а-яёА-ЯЁ]")
+
+
+def translate_to_en(text):
+    """Возвращает (текст_на_английском, был_ли_перевод). Бросает исключение, если перевод нужен, но не вышел."""
+    if not CYR.search(text):
+        return text, False
+    # 1) неофициальный бесплатный переводчик Google
+    try:
+        r = requests.get("https://translate.googleapis.com/translate_a/single",
+                         params={"client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": text}, timeout=8)
+        r.raise_for_status()
+        out = "".join(part[0] for part in r.json()[0] if part and part[0]).strip()
+        if out:
+            return out, True
+    except Exception as e:
+        log.warning("translate (google) failed: %s", e)
+    # 2) запасной вариант: MyMemory
+    try:
+        r = requests.get("https://api.mymemory.translated.net/get",
+                         params={"q": text[:450], "langpair": "ru|en"}, timeout=8)
+        out = r.json()["responseData"]["translatedText"].strip()
+        if out and not CYR.search(out):
+            return out, True
+    except Exception as e:
+        log.warning("translate (mymemory) failed: %s", e)
+    raise RuntimeError("translation failed")
+
+
+# кэш последних картинок (для кнопки «Без сжатия»)
+image_cache = OrderedDict()
+image_counter = itertools.count(1)
+CACHE_MAX = 30
+
+
+def cache_image(img):
+    key = next(image_counter)
+    with state_lock:
+        image_cache[key] = img
+        while len(image_cache) > CACHE_MAX:
+            image_cache.popitem(last=False)
+    return key
+
+
 def run_generation(user_id, chat_id, prompt, kind, status_id):
     global queue_size
     try:
         u = get_user_data(user_id)
+        try:
+            en, translated = translate_to_en(prompt)
+        except Exception:
+            log.exception("translate failed")
+            refund_consume(user_id, kind)
+            notify_user(chat_id, "⚠️ Не удалось перевести описание. Напишите его на английском или попробуйте позже. Попытка не списана.")
+            return
+        if BLOCKED.search(en):
+            refund_consume(user_id, kind)
+            notify_user(chat_id, "🚫 Такой запрос запрещён правилами бота. Попытка не списана.")
+            return
         wait_gate()
-        img = generate_image(prompt, u["style"], u["size"], random.randint(1, 10**9))
+        img = generate_image(en[:400], u["style"], u["size"], random.randint(1, 10**9))
+        key = cache_image(img)
         photo = BytesIO(img)
         photo.name = "image.jpg"
         caption = (f"🖼 <b>{html.escape(prompt[:200])}</b>\n"
                    f"{STYLES[u['style']][0]} · {SIZES[u['size']][0]}")
-        bot.send_photo(chat_id, photo, caption=caption, parse_mode="HTML", reply_markup=kb_result())
+        if translated:
+            caption += f"\n🌐 <i>{html.escape(en[:150])}</i>"
+        bot.send_photo(chat_id, photo, caption=caption, parse_mode="HTML", reply_markup=kb_result(key))
         log_generation(user_id, prompt, u["style"], u["size"])
     except Exception:
         log.exception("generation failed")
@@ -331,10 +396,11 @@ def kb_back():
     return m
 
 
-def kb_result():
+def kb_result(key=0):
     m = types.InlineKeyboardMarkup(row_width=2)
     m.add(types.InlineKeyboardButton("🔄 Ещё вариант", callback_data="again"),
-          types.InlineKeyboardButton("🏠 Меню", callback_data="menu_new"))
+          types.InlineKeyboardButton("📎 Без сжатия", callback_data=f"doc_{key}"))
+    m.add(types.InlineKeyboardButton("🏠 Меню", callback_data="menu_new"))
     return m
 
 
@@ -371,6 +437,8 @@ HELP_TEXT = ("❓ <b>Помощь</b>\n\n"
              "• Просто отправьте текстовое описание — бот нарисует картинку.\n"
              "• «Стиль» и «Формат» меняют внешний вид результата.\n"
              "• «Ещё вариант» — та же идея, но с другим результатом.\n"
+             "• «Без сжатия» — пришлёт картинку файлом в полном качестве.\n"
+             "• Русский текст бот переводит на английский сам.\n"
              f"• Бесплатно {DAILY_FREE} генераций в сутки.\n"
              "• Не принимаются запросы 18+ и запрещённый контент.")
 
@@ -420,6 +488,14 @@ def router(call):
                 set_user_field(uid, "size", key)
                 edit_safe(call, "📐 <b>Выберите формат:</b>", kb_choice(SIZES, key, "set_size"))
                 alert = f"Формат: {SIZES[key][0]}"
+        elif data.startswith("doc_"):
+            img = image_cache.get(int(data[4:] or 0))
+            if not img:
+                alert = "Файл устарел, создайте картинку заново."
+            else:
+                doc = BytesIO(img)
+                doc.name = "image.jpg"
+                bot.send_document(call.message.chat.id, doc)
         elif data == "again":
             u = get_user_data(uid)
             if not u["last_prompt"]:
