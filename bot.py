@@ -37,14 +37,35 @@ MIN_INTERVAL = float(os.environ.get("MIN_INTERVAL", 16))  # пауза межд�
 MAX_QUEUE = 10                                            # максимум задач в очереди
 
 STYLES = {
-    "none":      ("✨ Без стиля", ""),
-    "cartoon":   ("🎬 Мультфильм", ", cartoon style, flat colors, bold outlines, 2d animation, vibrant, clean lineart"),
-    "realistic": ("📷 Реализм", ", photorealistic, highly detailed, natural lighting, 8k"),
-    "anime":     ("🌸 Аниме", ", anime style, vibrant colors, detailed illustration"),
-    "art":       ("🎨 Арт", ", digital painting, concept art, artstation, detailed"),
-    "3d":        ("🧊 3D", ", 3d render, octane render, soft lighting, high detail"),
-    "pixel":     ("👾 Пиксель-арт", ", pixel art, 16-bit, retro game style, limited palette"),
-    "cyber":     ("🌃 Киберпанк", ", cyberpunk, neon lights, futuristic city, cinematic lighting"),
+    "none":      ("✨ Без стиля", "", "", "", ""),
+    "cartoon":   ("🎬 Мультфильм",
+                  "cartoon illustration, 2d animation style, flat colors, bold black outlines, cel shading, ",
+                  ", vibrant colors", "flux",
+                  "photorealistic, photo, realistic, 3d render, detailed skin, painting"),
+    "realistic": ("📷 Реализм",
+                  "professional photo, ",
+                  ", photorealistic, natural lighting, sharp focus, 8k", "flux-realism",
+                  "cartoon, anime, illustration, drawing"),
+    "anime":     ("🌸 Аниме",
+                  "anime illustration, ",
+                  ", vibrant colors, detailed, studio quality", "flux-anime",
+                  "photorealistic, 3d render, photo"),
+    "art":       ("🎨 Арт",
+                  "digital painting, concept art, ",
+                  ", artstation, highly detailed", "flux",
+                  "photo, low quality, blurry"),
+    "3d":        ("🧊 3D",
+                  "3d render, ",
+                  ", octane render, soft lighting, high detail, pixar style", "flux-3d",
+                  "flat, 2d, sketch, drawing"),
+    "pixel":     ("👾 Пиксель-арт",
+                  "pixel art, ",
+                  ", 16-bit, retro game style, limited palette", "flux",
+                  "smooth, blurry, photorealistic, 3d render"),
+    "cyber":     ("🌃 Киберпанк",
+                  "cyberpunk scene, ",
+                  ", neon lights, futuristic city, cinematic lighting", "flux",
+                  "daylight, rustic, countryside"),
 }
 SIZES = {
     "square":    ("⬜ Квадрат", (1024, 1024)),
@@ -248,18 +269,38 @@ def wait_gate():
 
 
 def generate_image(prompt, style_key, size_key, seed):
-    """Возвращает байты картинки или бросает исключение."""
-    full = prompt + STYLES[style_key][1] + SAFE_SUFFIX
+    """Возвращает байты картинки или бросает исключение.
+    Пробует модель стиля, затем обычную, затем запрос без указания модели."""
+    label, prefix, suffix, style_model, style_neg = STYLES[style_key]
+    full = f"{prefix}{prompt}{suffix}{SAFE_SUFFIX}"
+    negative = ", ".join(x for x in (NEGATIVE_PROMPT, style_neg) if x)
     width, height = SIZES[size_key][1]
     url = f"https://image.pollinations.ai/prompt/{quote(full, safe='')}"
-    params = {"width": width, "height": height, "seed": seed, "nologo": "true",
-              "safe": "true", "negative_prompt": NEGATIVE_PROMPT, "model": IMAGE_MODEL}
     headers = {"Authorization": f"Bearer {IMAGE_API_KEY}"} if IMAGE_API_KEY else {}
-    r = requests.get(url, params=params, headers=headers, timeout=120)
-    ctype = r.headers.get("content-type", "")
-    if r.status_code != 200 or not ctype.startswith("image/") or len(r.content) < 2000:
-        raise RuntimeError(f"image api: {r.status_code} {ctype} {r.text[:200] if 'text' in ctype or 'json' in ctype else ''}")
-    return r.content
+
+    models = []
+    for m in (style_model or IMAGE_MODEL, IMAGE_MODEL, None):
+        if m not in models:
+            models.append(m)
+
+    last_err = None
+    for i, model in enumerate(models):
+        params = {"width": width, "height": height, "seed": seed, "nologo": "true",
+                  "safe": "true", "negative_prompt": negative}
+        if model:
+            params["model"] = model
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=120)
+            ctype = r.headers.get("content-type", "")
+            if r.status_code == 200 and ctype.startswith("image/") and len(r.content) >= 2000:
+                return r.content
+            last_err = f"{r.status_code} {ctype} {r.text[:150] if ('text' in ctype or 'json' in ctype) else ''}"
+        except requests.RequestException as e:
+            last_err = str(e)
+        log.warning("image api: модель %s не сработала: %s", model, last_err)
+        if i < len(models) - 1:
+            time.sleep(3)
+    raise RuntimeError(f"image api failed: {last_err}")
 
 
 CYR = re.compile(r"[а-яёА-ЯЁ]")
