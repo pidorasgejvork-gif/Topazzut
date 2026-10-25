@@ -7,6 +7,7 @@ import time
 import queue
 import random
 import hmac
+import json
 import hashlib
 import sqlite3
 import logging
@@ -46,6 +47,8 @@ REF_WELCOME = int(os.environ.get("REF_WELCOME", 1))        # приглашён�
 USER_COOLDOWN = float(os.environ.get("USER_COOLDOWN", 4))  # пауза между запросами одного человека
 MIN_INTERVAL = float(os.environ.get("MIN_INTERVAL", 16))   # пауза между запросами к API картинок
 MAX_QUEUE = int(os.environ.get("MAX_QUEUE", 15))
+IMAGE_ATTEMPT_TIMEOUT = int(os.environ.get("IMAGE_ATTEMPT_TIMEOUT", 70))   # сек на одну попытку
+IMAGE_TOTAL_TIMEOUT = int(os.environ.get("IMAGE_TOTAL_TIMEOUT", 120))      # сек на все попытки вместе
 WORKERS = int(os.environ.get("WORKERS", 2))
 KEEP_ALIVE = os.environ.get("KEEP_ALIVE", "1") == "1"
 
@@ -65,9 +68,15 @@ app = Flask(__name__)
 TG_SECRET = hashlib.sha256(TOKEN.encode()).hexdigest()
 
 state_lock = threading.Lock()
-busy_users = set()
-last_request = {}
+busy_users = set()   # у кого сейчас идёт генерация
+active_jobs = {}     # uid -> задача (для отмены и сторожа)
 pending_jobs = 0
+job_counter = [0]
+JOB_MARGIN = int(os.environ.get("JOB_MARGIN", 15))            # запас времени на одну картинку, сек
+JOB_BASE_TIMEOUT = int(os.environ.get("JOB_BASE_TIMEOUT", 60))   # на перевод/улучшение описания и отправку
+JOB_QUEUE_LIMIT = int(os.environ.get("JOB_QUEUE_LIMIT", 600))    # максимум ожидания в очереди, сек
+WATCHDOG_INTERVAL = float(os.environ.get("WATCHDOG_INTERVAL", 20))
+last_request = {}
 fail_streak = 0
 last_alert = 0.0
 job_queue = queue.Queue()
@@ -361,7 +370,11 @@ T = {
         "too_long": "Описание слишком длинное (максимум 500 символов).",
         "blocked": "🚫 Такой запрос запрещён правилами бота. Попытка не списана.",
         "cooldown": "⏳ Не так быстро, подождите {s} сек.",
-        "busy": "⏳ Дождитесь завершения предыдущей генерации.",
+        "busy": "⏳ Дождитесь завершения предыдущей генерации. Если она зависла, отправьте /reset",
+        "cancelled": "✅ Готово, можно отправлять новое описание.",
+        "reset_done": "🔄 Генерация отменена, попытка возвращена. Можно отправить новый запрос.",
+        "reset_none": "Сейчас нет активных генераций. Можно отправлять описание.",
+        "stuck_refund": "⚠️ Сервис картинок слишком долго не отвечает. Попытка возвращена, попробуйте ещё раз чуть позже.",
         "queue_full": "😔 Сейчас слишком много запросов. Попробуйте через минуту.",
         "limit_over": ("❌ Бесплатные генерации на сегодня закончились.\nЛимит обновится завтра. "
                        "Можно купить пакет («Купить»), ввести промокод или пригласить друзей. Вопросы: @{support}"),
@@ -447,7 +460,11 @@ T = {
         "too_long": "Description is too long (500 characters max).",
         "blocked": "🚫 This request is not allowed. Your attempt was not used.",
         "cooldown": "⏳ Slow down, wait {s} sec.",
-        "busy": "⏳ Please wait for your previous generation to finish.",
+        "busy": "⏳ Please wait for your previous generation to finish. If it is stuck, send /reset",
+        "cancelled": "✅ Done, you can send a new description.",
+        "reset_done": "🔄 Generation cancelled, your attempt was refunded. You can send a new request.",
+        "reset_none": "No active generations right now. You can send a description.",
+        "stuck_refund": "⚠️ The image service is not responding. Your attempt was refunded, please try again a bit later.",
         "queue_full": "😔 Too many requests right now. Try again in a minute.",
         "limit_over": ("❌ You're out of free generations for today.\nThe limit resets tomorrow. "
                        "You can buy a pack («Buy»), use a promo code or invite friends. Questions: @{support}"),
@@ -691,6 +708,34 @@ def item_price(item):
 # ============================================================
 #                   ГЕНЕРАЦИЯ: ПЕРЕВОД, УЛУЧШЕНИЕ, КАРТИНКА
 # ============================================================
+class Resp:
+    """Лёгкий ответ: status_code, headers, content, text."""
+
+    def __init__(self, status_code, headers, content, encoding):
+        self.status_code = status_code
+        self.headers = headers
+        self.content = content
+        self.text = content.decode(encoding or "utf-8", errors="replace")
+
+
+def http_get(url, params=None, headers=None, total_timeout=60, max_bytes=20_000_000):
+    """GET с ЖЁСТКИМ общим лимитом времени (обычный timeout у requests этого не гарантирует)."""
+    deadline = time.time() + total_timeout
+    r = requests.get(url, params=params, headers=headers or {}, timeout=(8, total_timeout), stream=True)
+    try:
+        chunks, size = [], 0
+        for chunk in r.iter_content(65536):
+            chunks.append(chunk)
+            size += len(chunk)
+            if time.time() > deadline:
+                raise requests.Timeout(f"общий лимит {total_timeout} сек превышен")
+            if size > max_bytes:
+                raise requests.RequestException("ответ слишком большой")
+        return Resp(r.status_code, r.headers, b"".join(chunks), r.encoding)
+    finally:
+        r.close()
+
+
 CYR = re.compile(r"[а-яёА-ЯЁ]")
 
 
@@ -699,18 +744,19 @@ def translate_to_en(text):
     if not CYR.search(text):
         return text, False
     try:
-        r = requests.get("https://translate.googleapis.com/translate_a/single",
-                         params={"client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": text}, timeout=8)
-        r.raise_for_status()
-        out = "".join(part[0] for part in r.json()[0] if part and part[0]).strip()
+        r = http_get("https://translate.googleapis.com/translate_a/single",
+                     params={"client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": text}, total_timeout=10)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        out = "".join(part[0] for part in json.loads(r.text)[0] if part and part[0]).strip()
         if out:
             return out, True
     except Exception as e:
         log.warning("translate (google) failed: %s", e)
     try:
-        r = requests.get("https://api.mymemory.translated.net/get",
-                         params={"q": text[:450], "langpair": "ru|en"}, timeout=8)
-        out = r.json()["responseData"]["translatedText"].strip()
+        r = http_get("https://api.mymemory.translated.net/get",
+                     params={"q": text[:450], "langpair": "ru|en"}, total_timeout=10)
+        out = json.loads(r.text)["responseData"]["translatedText"].strip()
         if out and not CYR.search(out):
             return out, True
     except Exception as e:
@@ -727,9 +773,10 @@ ENHANCE_SYSTEM = ("You write prompts for a text-to-image model. Rewrite the user
 def enhance_prompt(text):
     """Улучшает описание через бесплатный текстовый API. При любой проблеме возвращает None."""
     try:
-        r = requests.get("https://text.pollinations.ai/" + quote(text, safe=""),
-                         params={"model": "openai", "system": ENHANCE_SYSTEM, "seed": random.randint(1, 10**6)},
-                         headers={"Authorization": f"Bearer {IMAGE_API_KEY}"} if IMAGE_API_KEY else {}, timeout=20)
+        r = http_get("https://text.pollinations.ai/" + quote(text, safe=""),
+                     params={"model": "openai", "system": ENHANCE_SYSTEM, "seed": random.randint(1, 10**6)},
+                     headers={"Authorization": f"Bearer {IMAGE_API_KEY}"} if IMAGE_API_KEY else {},
+                     total_timeout=15)
         if r.status_code != 200:
             return None
         lines = [ln.strip() for ln in r.text.strip().splitlines()
@@ -782,18 +829,23 @@ def generate_image(prompt, style_key, size_key, seed):
             models.append(m)
 
     last_err = None
+    deadline = time.time() + IMAGE_TOTAL_TIMEOUT
     for i, model in enumerate(models):
+        remaining = deadline - time.time()
+        if remaining < 10:
+            last_err = last_err or "время вышло"
+            break
         params = {"width": width, "height": height, "seed": seed, "nologo": "true",
                   "safe": "true", "negative_prompt": negative}
         if model:
             params["model"] = model
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=120)
+            r = http_get(url, params=params, headers=headers, total_timeout=min(IMAGE_ATTEMPT_TIMEOUT, remaining))
             ctype = r.headers.get("content-type", "")
             if r.status_code == 200 and ctype.startswith("image/") and len(r.content) >= 2000:
                 return r.content
             last_err = f"{r.status_code} {ctype} {r.text[:150] if ('text' in ctype or 'json' in ctype) else ''}"
-        except requests.RequestException as e:
+        except Exception as e:
             last_err = str(e)
         log.warning("image api: модель %s не сработала: %s", model, last_err)
         if i < len(models) - 1:
@@ -975,6 +1027,78 @@ def send_menu(chat_id, u):
 # ============================================================
 #                  ЗАПУСК ГЕНЕРАЦИИ И ОЧЕРЕДЬ
 # ============================================================
+def job_limit(job):
+    """Сколько секунд задача может выполняться, прежде чем её сочтут зависшей."""
+    return JOB_BASE_TIMEOUT + job["n"] * (MIN_INTERVAL + IMAGE_TOTAL_TIMEOUT + JOB_MARGIN)
+
+
+def release_job(job):
+    """Освобождает пользователя и очередь. Можно вызывать много раз: сработает один."""
+    global pending_jobs
+    with state_lock:
+        if job.get("released"):
+            return False
+        job["released"] = True
+        busy_users.discard(job["uid"])
+        if active_jobs.get(job["uid"]) is job:
+            active_jobs.pop(job["uid"], None)
+        pending_jobs = max(pending_jobs - 1, 0)
+        return True
+
+
+def refund_job(job, kinds):
+    """Возврат попыток. Если задачу уже отменили, всё вернули при отмене."""
+    if not job.get("released"):
+        refund(job["uid"], kinds)
+
+
+def spawn_worker():
+    threading.Thread(target=worker_loop, daemon=True).start()
+
+
+def cancel_job(job, reason):
+    """Отменяет зависшую задачу и возвращает попытки. reason: 'timeout' | 'reset'."""
+    if not release_job(job):
+        return False
+    uid = job["uid"]
+    u = get_user(uid) or {"lang": "ru"}
+    try:
+        refund(uid, job["kinds"])
+    except Exception:
+        log.exception("refund on cancel failed")
+    notify_user(job["chat_id"], t(u, "reset_done" if reason == "reset" else "stuck_refund"))
+    if job.get("status_id"):
+        try:
+            bot.delete_message(job["chat_id"], job["status_id"])
+        except Exception:
+            pass
+    log.warning("задача отменена uid=%s причина=%s", uid, reason)
+    if reason == "timeout":
+        spawn_worker()      # поток мог зависнуть вместе с запросом — запускаем замену
+        register_failure()
+    return True
+
+
+def watchdog_loop():
+    while True:
+        time.sleep(WATCHDOG_INTERVAL)
+        try:
+            now_t = time.time()
+            with state_lock:
+                stuck = []
+                for j in active_jobs.values():
+                    if j.get("released"):
+                        continue
+                    started = j.get("started")
+                    if (started and now_t - started > job_limit(j)) or \
+                            (not started and now_t - j["created"] > JOB_QUEUE_LIMIT):
+                        stuck.append(j)
+            for j in stuck:
+                cancel_job(j, "timeout")
+        except Exception:
+            log.exception("watchdog error")
+
+
 def start_generation(chat_id, tg_user, prompt, n=1, style=None, size=None, extra=None):
     """Проверяет запрос, списывает попытки и ставит задачу в очередь."""
     global pending_jobs
@@ -992,6 +1116,8 @@ def start_generation(chat_id, tg_user, prompt, n=1, style=None, size=None, extra
     if not is_subscribed(uid):
         return bot.send_message(chat_id, t(u, "sub_required", ch=CHANNEL_USERNAME))
 
+    if extra is None:
+        extra = PRESETS[u["preset"]]["extra"] if u["preset"] in PRESETS else ""
     with state_lock:
         wait = USER_COOLDOWN - (time.time() - last_request.get(uid, 0))
         if wait > 0:
@@ -1006,19 +1132,31 @@ def start_generation(chat_id, tg_user, prompt, n=1, style=None, size=None, extra
                 return bot.send_message(chat_id, t(u, "not_enough", n=n))
             return bot.send_message(chat_id, t(u, "limit_over", support=SUPPORT_USERNAME), parse_mode="HTML",
                                     reply_markup=kb_back(u))
+        job_counter[0] += 1
+        job = {"id": job_counter[0], "uid": uid, "chat_id": chat_id, "prompt": prompt, "n": n, "kinds": kinds,
+               "style": style or u["style"], "size": size or u["size"], "extra": extra,
+               "status_id": None, "created": time.time(), "started": None, "released": False}
         busy_users.add(uid)
+        active_jobs[uid] = job
         pending_jobs += 1
         position = pending_jobs
         last_request[uid] = time.time()
 
-    use_style = style or u["style"]
-    use_size = size or u["size"]
-    if extra is None:
-        extra = PRESETS[u["preset"]]["extra"] if u["preset"] in PRESETS else ""
-    set_user_field(uid, "last_prompt", prompt)
-    status = bot.send_message(chat_id, t(u, "queued", pos=position))
-    job_queue.put({"uid": uid, "chat_id": chat_id, "prompt": prompt, "n": n, "kinds": kinds,
-                   "style": use_style, "size": use_size, "extra": extra, "status_id": status.message_id})
+    # с этого момента любая ошибка обязана освободить пользователя и вернуть попытки
+    try:
+        set_user_field(uid, "last_prompt", prompt)
+        status = bot.send_message(chat_id, t(u, "queued", pos=position))
+        job["status_id"] = status.message_id
+        job_queue.put(job)
+        log.info("задача #%s поставлена uid=%s n=%s позиция=%s", job["id"], uid, n, position)
+    except Exception:
+        log.exception("не удалось поставить задачу в очередь")
+        if release_job(job):
+            refund(uid, kinds)
+        try:
+            bot.send_message(chat_id, t(u, "gen_fail"))
+        except Exception:
+            pass
 
 
 def register_failure():
@@ -1065,34 +1203,49 @@ def send_results(job, u, en, translated, enhanced, images):
 
 
 def process_job(job):
-    global pending_jobs
     uid, chat_id, n, kinds = job["uid"], job["chat_id"], job["n"], job["kinds"]
+    if job.get("released"):
+        return  # уже отменена (зависание или /reset)
+    job["started"] = time.time()
     u = get_user(uid) or {"lang": "ru", "user_id": uid, "enhance": 1}
+    log.info("задача #%s начата uid=%s стиль=%s формат=%s", job["id"], uid, job["style"], job["size"])
     try:
         try:
             en, translated, enhanced = build_prompt(job["prompt"], bool(u.get("enhance", 1)))
         except Exception:
             log.exception("prompt preparation failed")
-            refund(uid, kinds)
+            refund_job(job, kinds)
             notify_user(chat_id, t(u, "translate_fail"))
             return
+        log.info("задача #%s: промпт готов (перевод=%s, улучшение=%s) за %.1f с",
+                 job["id"], translated, enhanced, time.time() - job["started"])
+        if job.get("released"):
+            return
         if is_blocked(en):
-            refund(uid, kinds)
+            refund_job(job, kinds)
             notify_user(chat_id, t(u, "blocked"))
             return
 
         done = []
-        for _ in range(n):
+        for i in range(n):
+            # новую картинку не начинаем, если на неё уже не хватит времени
+            if i > 0 and time.time() - job["started"] > job_limit(job) - IMAGE_TOTAL_TIMEOUT - MIN_INTERVAL - JOB_MARGIN:
+                log.warning("задача #%s: время вышло, остальные картинки пропущены", job["id"])
+                break
             try:
                 wait_gate()
+                t0 = time.time()
                 done.append(generate_image(en[:350] + job["extra"], job["style"], job["size"],
                                            random.randint(1, 10**9)))
+                log.info("задача #%s: картинка %s/%s готова за %.1f с", job["id"], i + 1, n, time.time() - t0)
             except Exception:
                 log.exception("generation failed")
                 break
+        if job.get("released"):
+            return  # пользователю уже вернули попытки, результат не нужен
         failed = n - len(done)
         if failed:
-            refund(uid, kinds[len(done):])
+            refund_job(job, kinds[len(done):])
         if not done:
             register_failure()
             notify_user(chat_id, t(u, "gen_fail"))
@@ -1101,21 +1254,21 @@ def process_job(job):
         if failed:
             notify_user(chat_id, t(u, "partial", done=len(done), n=n))
         send_results(job, u, en, translated, enhanced, done)
+        log.info("задача #%s завершена за %.1f с", job["id"], time.time() - job["started"])
     except Exception:
         log.exception("process_job crashed")
         try:
-            refund(uid, kinds)
+            refund_job(job, kinds)
         except Exception:
             pass
         notify_user(chat_id, t(u, "gen_fail"))
     finally:
-        with state_lock:
-            busy_users.discard(uid)
-            pending_jobs = max(pending_jobs - 1, 0)
-        try:
-            bot.delete_message(chat_id, job["status_id"])
-        except Exception:
-            pass
+        release_job(job)
+        if job.get("status_id"):
+            try:
+                bot.delete_message(chat_id, job["status_id"])
+            except Exception:
+                pass
 
 
 def worker_loop():
@@ -1217,6 +1370,21 @@ def send_screen(message, builder):
     bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
 
 
+@bot.message_handler(commands=["reset", "cancel"])
+def cmd_reset(message):
+    u = user_for(message)
+    if not u:
+        return
+    job = active_jobs.get(u["user_id"])
+    if job and cancel_job(job, "reset"):
+        return
+    # на всякий случай снимаем «занят», даже если задачи уже нет
+    with state_lock:
+        busy_users.discard(u["user_id"])
+        last_request.pop(u["user_id"], None)
+    bot.send_message(message.chat.id, t(u, "reset_none"))
+
+
 @bot.message_handler(commands=["help"])
 def cmd_help(message):
     send_screen(message, screen_help)
@@ -1295,7 +1463,7 @@ def admin_stats_text():
         reports = first(c.execute("SELECT COUNT(*) FROM reports"))
         paid = c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(price),0) AS s FROM orders WHERE status='paid'").fetchone()
         subs = first(c.execute("SELECT COUNT(*) FROM users WHERE sub_until > ?", (now_str(),)))
-        queue_now = pending_jobs
+        queue_now = len(active_jobs)
     return (f"📊 <b>Статистика</b>\n\n👥 Пользователей: {users}\n🖼 Генераций всего: {total}\n📅 Сегодня: {day}\n"
             f"🚩 Жалоб: {reports}\n💰 Оплат: {paid['n']} на {paid['s']:.0f}₽\n♾ Активных подписок: {subs}\n"
             f"⏳ В очереди сейчас: {queue_now}")
@@ -1671,7 +1839,8 @@ def startup():
     reload_block_words()
     setup_webhook()
     for _ in range(WORKERS):
-        threading.Thread(target=worker_loop, daemon=True).start()
+        spawn_worker()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
     if KEEP_ALIVE and WEBHOOK_URL:
         threading.Thread(target=keep_alive_loop, daemon=True).start()
     log.info("Бот запущен (bot.py), БД: %s", "Postgres" if USE_PG else "SQLite")
