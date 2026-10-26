@@ -15,7 +15,7 @@ import threading
 from io import BytesIO
 from datetime import datetime, timedelta
 from contextlib import contextmanager
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from urllib.parse import quote
 
 import requests
@@ -60,6 +60,29 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("imagebot")
 telebot.logger.setLevel(logging.INFO)
 
+BOT_VERSION = "2026-10-24-stable-queue"
+
+
+class RingHandler(logging.Handler):
+    """Хранит последние строки лога в памяти, чтобы показать их админу командой /debug."""
+
+    def __init__(self):
+        super().__init__()
+        self.buf = deque(maxlen=120)
+
+    def emit(self, record):
+        try:
+            line = f"{time.strftime('%H:%M:%S')} {record.levelname[:4]} {record.getMessage()}"
+            if record.exc_info and record.exc_info[1]:
+                line += f" | {record.exc_info[0].__name__}: {str(record.exc_info[1])[:160]}"
+            self.buf.append(line[:400])
+        except Exception:
+            pass
+
+
+ring_log = RingHandler()
+logging.getLogger().addHandler(ring_log)
+
 if not TOKEN:
     raise RuntimeError("Не задана переменная окружения TOKEN")
 
@@ -74,7 +97,7 @@ pending_jobs = 0
 job_counter = [0]
 JOB_MARGIN = int(os.environ.get("JOB_MARGIN", 15))            # запас времени на одну картинку, сек
 JOB_BASE_TIMEOUT = int(os.environ.get("JOB_BASE_TIMEOUT", 60))   # на перевод/улучшение описания и отправку
-JOB_QUEUE_LIMIT = int(os.environ.get("JOB_QUEUE_LIMIT", 600))    # максимум ожидания в очереди, сек
+JOB_QUEUE_LIMIT = int(os.environ.get("JOB_QUEUE_LIMIT", 300))    # максимум ожидания в очереди, сек
 WATCHDOG_INTERVAL = float(os.environ.get("WATCHDOG_INTERVAL", 20))
 last_request = {}
 fail_streak = 0
@@ -89,7 +112,27 @@ if USE_PG:
     import psycopg2
     import psycopg2.pool
     import psycopg2.extras
-    pg_pool = psycopg2.pool.ThreadedConnectionPool(1, 8, DATABASE_URL)
+    pg_pool = psycopg2.pool.ThreadedConnectionPool(
+        1, 8, DATABASE_URL, connect_timeout=10, keepalives=1, keepalives_idle=30,
+        keepalives_interval=10, keepalives_count=3, options="-c statement_timeout=15000")
+
+    def pg_get_conn():
+        """Берёт соединение из пула и проверяет, что оно живое (бесплатные Postgres «засыпают»)."""
+        for _ in range(3):
+            raw = pg_get_conn()
+            try:
+                if raw.closed:
+                    raise psycopg2.OperationalError("closed")
+                with raw.cursor() as cur:
+                    cur.execute("SELECT 1")
+                raw.commit()
+                return raw
+            except Exception:
+                try:
+                    pg_pool.putconn(raw, close=True)
+                except Exception:
+                    pass
+        return pg_pool.getconn()
 
 
 class Conn:
@@ -373,6 +416,8 @@ T = {
         "busy": "⏳ Дождитесь завершения предыдущей генерации. Если она зависла, отправьте /reset",
         "cancelled": "✅ Готово, можно отправлять новое описание.",
         "reset_done": "🔄 Генерация отменена, попытка возвращена. Можно отправить новый запрос.",
+        "phase_prepare": "🧠 Готовлю описание…",
+        "phase_draw": "🎨 Рисую… Обычно 10–60 секунд.",
         "reset_none": "Сейчас нет активных генераций. Можно отправлять описание.",
         "stuck_refund": "⚠️ Сервис картинок слишком долго не отвечает. Попытка возвращена, попробуйте ещё раз чуть позже.",
         "queue_full": "😔 Сейчас слишком много запросов. Попробуйте через минуту.",
@@ -463,6 +508,8 @@ T = {
         "busy": "⏳ Please wait for your previous generation to finish. If it is stuck, send /reset",
         "cancelled": "✅ Done, you can send a new description.",
         "reset_done": "🔄 Generation cancelled, your attempt was refunded. You can send a new request.",
+        "phase_prepare": "🧠 Preparing the description…",
+        "phase_draw": "🎨 Drawing… Usually 10–60 seconds.",
         "reset_none": "No active generations right now. You can send a description.",
         "stuck_refund": "⚠️ The image service is not responding. Your attempt was refunded, please try again a bit later.",
         "queue_full": "😔 Too many requests right now. Try again in a minute.",
@@ -1052,8 +1099,24 @@ def refund_job(job, kinds):
         refund(job["uid"], kinds)
 
 
+worker_threads = []
+watchdog_thread = []
+
+
 def spawn_worker():
-    threading.Thread(target=worker_loop, daemon=True).start()
+    th = threading.Thread(target=worker_loop, daemon=True)
+    th.start()
+    worker_threads.append(th)
+
+
+def set_phase(job, u, key):
+    """Показывает пользователю, на каком этапе задача (правит сообщение «Рисую...»)."""
+    if not job.get("status_id"):
+        return
+    try:
+        bot.edit_message_text(t(u, key), job["chat_id"], job["status_id"])
+    except Exception:
+        pass
 
 
 def cancel_job(job, reason):
@@ -1074,7 +1137,6 @@ def cancel_job(job, reason):
             pass
     log.warning("задача отменена uid=%s причина=%s", uid, reason)
     if reason == "timeout":
-        spawn_worker()      # поток мог зависнуть вместе с запросом — запускаем замену
         register_failure()
     return True
 
@@ -1095,6 +1157,11 @@ def watchdog_loop():
                         stuck.append(j)
             for j in stuck:
                 cancel_job(j, "timeout")
+            alive = [th for th in worker_threads if th.is_alive()]
+            worker_threads[:] = alive
+            for _ in range(WORKERS - len(alive)):
+                log.error("воркер не жив — запускаем новый")
+                spawn_worker()
         except Exception:
             log.exception("watchdog error")
 
@@ -1210,6 +1277,7 @@ def process_job(job):
     u = get_user(uid) or {"lang": "ru", "user_id": uid, "enhance": 1}
     log.info("задача #%s начата uid=%s стиль=%s формат=%s", job["id"], uid, job["style"], job["size"])
     try:
+        set_phase(job, u, "phase_prepare")
         try:
             en, translated, enhanced = build_prompt(job["prompt"], bool(u.get("enhance", 1)))
         except Exception:
@@ -1226,6 +1294,7 @@ def process_job(job):
             notify_user(chat_id, t(u, "blocked"))
             return
 
+        set_phase(job, u, "phase_draw")
         done = []
         for i in range(n):
             # новую картинку не начинаем, если на неё уже не хватит времени
@@ -1271,11 +1340,25 @@ def process_job(job):
                 pass
 
 
+def safe_process(job):
+    try:
+        process_job(job)
+    except Exception:
+        log.exception("process_job error")
+        release_job(job)
+
+
 def worker_loop():
+    """Воркер никогда не зависает: задачу выполняет отдельный поток, а воркер ждёт его не дольше лимита."""
     while True:
         job = job_queue.get()
         try:
-            process_job(job)
+            th = threading.Thread(target=safe_process, args=(job,), daemon=True)
+            th.start()
+            th.join(job_limit(job) + 10)
+            if th.is_alive():
+                log.error("задача #%s не завершилась за %s с, поток брошен", job.get("id"), job_limit(job) + 10)
+                cancel_job(job, "timeout")
         except Exception:
             log.exception("worker error")
         finally:
@@ -1359,7 +1442,7 @@ def user_for(message):
 
 @bot.message_handler(commands=["ping"])
 def cmd_ping(message):
-    bot.send_message(message.chat.id, T["ru"]["ping"])
+    bot.send_message(message.chat.id, f'{T["ru"]["ping"]}\nВерсия: {BOT_VERSION}')
 
 
 def send_screen(message, builder):
@@ -1444,7 +1527,7 @@ def admin_markup():
     return m
 
 
-ADMIN_HELP = ("🛠 <b>Админ-панель</b>\n\n/give ID КОЛ-ВО — выдать генерации\n/ban ID · /unban ID\n"
+ADMIN_HELP = ("🛠 <b>Админ-панель</b>\n\n/debug — состояние очереди и логи\n/selftest — проверка БД и сервисов картинок\n/give ID КОЛ-ВО — выдать генерации\n/ban ID · /unban ID\n"
               "/addpromo КОД КОЛ-ВО ИСПОЛЬЗОВАНИЙ — промокод на генерации\n"
               "/blockword слово · /unblockword слово — стоп-слова\n/broadcast ТЕКСТ")
 
@@ -1473,6 +1556,73 @@ def admin_stats_text():
 @admin_only
 def cmd_stats(message):
     bot.send_message(message.chat.id, admin_stats_text(), parse_mode="HTML")
+
+
+def debug_text():
+    now_t = time.time()
+    alive = sum(1 for th in worker_threads if th.is_alive())
+    lines = [f"версия: {BOT_VERSION}", f"БД: {'Postgres' if USE_PG else 'SQLite'}",
+             f"воркеров жив: {alive}/{WORKERS}",
+             f"сторож жив: {watchdog_thread[0].is_alive() if watchdog_thread else 'нет'}",
+             f"очередь: {job_queue.qsize()}, активных задач: {pending_jobs}, занятых: {sorted(busy_users)}"]
+    with state_lock:
+        jobs = list(active_jobs.values())
+    for j in jobs:
+        state = f"идёт {now_t - j['started']:.0f} с" if j.get("started") else "ждёт в очереди"
+        lines.append(f"  #{j['id']} uid={j['uid']} n={j['n']} создана {now_t - j['created']:.0f} с назад, {state}")
+    lines.append("--- последние строки лога ---")
+    lines += list(ring_log.buf)[-30:]
+    return "\n".join(lines)
+
+
+@bot.message_handler(commands=["debug"])
+@admin_only
+def cmd_debug(message):
+    text = debug_text()
+    for i in range(0, len(text), 3800):
+        bot.send_message(message.chat.id, text[i:i + 3800])
+
+
+def selftest_run(chat_id):
+    out = []
+    t0 = time.time()
+    try:
+        with db() as c:
+            c.execute("SELECT 1").fetchone()
+        out.append(f"✅ База данных: {time.time() - t0:.2f} с")
+    except Exception as e:
+        out.append(f"❌ База данных: {type(e).__name__}: {str(e)[:150]}")
+
+    headers = {"Authorization": f"Bearer {IMAGE_API_KEY}"} if IMAGE_API_KEY else {}
+    checks = [
+        ("Переводчик", "https://translate.googleapis.com/translate_a/single",
+         {"client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": "привет"}, {}, 15, False),
+        ("Улучшение описания", "https://text.pollinations.ai/" + quote("a red apple", safe=""),
+         {"model": "openai"}, headers, 30, False),
+        ("Картинки", "https://image.pollinations.ai/prompt/" + quote("a red apple on a table", safe=""),
+         {"width": 256, "height": 256, "seed": 1, "nologo": "true", "model": IMAGE_MODEL}, headers, 90, True),
+    ]
+    for name, url, params, hdrs, limit, is_image in checks:
+        t0 = time.time()
+        try:
+            r = http_get(url, params=params, headers=hdrs, total_timeout=limit)
+            ctype = r.headers.get("content-type", "")
+            good = r.status_code == 200 and (len(r.content) >= 2000 and ctype.startswith("image/") if is_image else len(r.content) > 0)
+            line = f"{'✅' if good else '❌'} {name}: HTTP {r.status_code}, {ctype[:30]}, {len(r.content)} байт, {time.time() - t0:.1f} с"
+            if not good and not ctype.startswith("image/"):
+                line += f"\n   ответ: {r.text[:200]}"
+            out.append(line)
+        except Exception as e:
+            out.append(f"❌ {name}: {type(e).__name__}: {str(e)[:150]} (через {time.time() - t0:.1f} с)")
+    bot.send_message(chat_id, "🔎 Результат проверки:\n\n" + "\n".join(out) +
+                     f"\n\nВерсия: {BOT_VERSION}, ключ картинок: {'есть' if IMAGE_API_KEY else 'нет'}")
+
+
+@bot.message_handler(commands=["selftest"])
+@admin_only
+def cmd_selftest(message):
+    bot.send_message(message.chat.id, "🔎 Проверяю базу и сервисы, до 2 минут…")
+    threading.Thread(target=selftest_run, args=(message.chat.id,), daemon=True).start()
 
 
 @bot.message_handler(commands=["give"])
@@ -1840,10 +1990,12 @@ def startup():
     setup_webhook()
     for _ in range(WORKERS):
         spawn_worker()
-    threading.Thread(target=watchdog_loop, daemon=True).start()
+    wd = threading.Thread(target=watchdog_loop, daemon=True)
+    wd.start()
+    watchdog_thread.append(wd)
     if KEEP_ALIVE and WEBHOOK_URL:
         threading.Thread(target=keep_alive_loop, daemon=True).start()
-    log.info("Бот запущен (bot.py), БД: %s", "Postgres" if USE_PG else "SQLite")
+    log.info("Бот запущен (bot.py) версия %s, БД: %s", BOT_VERSION, "Postgres" if USE_PG else "SQLite")
 
 
 startup()
